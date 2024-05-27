@@ -176,7 +176,7 @@ class MultiHeadAttention(hk.Module):
         self.resid_dropout = resid_dropout
         self.rote = RotaryEmbedding(self.k_dim)
 
-    # PERFORMANCE: taking three separate inputs is faster with jit
+    # NOTE: Even for self attention, accepting three separate arguments is faster with jit
     def __call__(self, q: jax.Array, k: jax.Array, v: jax.Array, kv_cache: jax.Array = None, is_training=True) -> jax.Array:
       """
         B: batch size
@@ -188,12 +188,12 @@ class MultiHeadAttention(hk.Module):
         h: number of query heads
         H: number of key/value heads
         G: number of query groups
+
+        q, k, v: B x t x D
+        kv_cache: B x T x H x (K+V)
       """
 
-      # q, k, v: B x t x D
-      # kv_cache: B x T x H x (K+V)
-      # q_heads: B x t x h x Q=K
-      # k_heads: B x T x H x K
+      # q_heads, k_heads: B x t x h x K
       # v_heads: B x T x H x V
       q_heads, k_heads, v_heads = self._attention_heads(q, k, v, kv_cache)
       attn_output = self._grouped_attention(q_heads, k_heads, v_heads, is_training) # B x t x D
@@ -205,23 +205,18 @@ class MultiHeadAttention(hk.Module):
       b_size, q_seq_len, _, _,  = q_heads.shape
       _, k_seq_len, _, _ = k_heads.shape
 
-      # grouped_q_heads: B x t x h x K -> B x t x G x H x K
       grouped_q_heads = q_heads.reshape((b_size, q_seq_len, self.q_group_size, self.num_kv_heads, self.k_dim))
 
-      # Dot product of query and key heads. G = query group size. Aggregation over K = key dimension. 
       attn_scores = jnp.einsum('BtGHK, BTHK-> BGHtT', grouped_q_heads, k_heads).astype(jnp.float32) 
-      # Mask out future tokens. Assume that query tokens are suffix of the key tokens. Take ending rows of the LT matrix.
       attn_mask = jnp.tril(jnp.ones((k_seq_len, k_seq_len)))[-q_seq_len:, :]
       attn_scores = jnp.where(attn_mask, attn_scores, -jnp.inf)
-      # Softmax, followed by dropout
+
       attn_scores = jax.nn.softmax(attn_scores / jnp.sqrt(self.k_dim), axis=-1).astype(v_heads.dtype)
       attn_scores = dropout(attn_scores, self.attn_dropout, hk.next_rng_key(), is_training)
-      # Apply attention scores on the value heads. Aggregation over T = length of the attended sequence
-      attn_output = jnp.einsum("BGHtT, BTHV -> BtGHV", attn_scores, v_heads)
 
-      # Reshape attn_output: B x t x G x H x V ->  B x t x (G * H * V)
+      attn_output = jnp.einsum("BGHtT, BTHV -> BtGHV", attn_scores, v_heads)
       attn_output = attn_output.reshape(b_size, q_seq_len, self.q_group_size * self.num_kv_heads * self.v_dim)
-      # Apply linear map on the attn_output: B x t x (G * H * V) -> B x t x D, followed by dropout
+
       attn_output = self.wo(attn_output)
       attn_output = dropout(attn_output, self.resid_dropout, hk.next_rng_key(), is_training)
 
@@ -229,7 +224,7 @@ class MultiHeadAttention(hk.Module):
 
     def _attention_heads(self, q: jax.Array, k: jax.Array, v: jax.Array, kv_cache: jax.Array = None) -> List[jax.Array]:
       """
-        x: B x t x D
+        q, k, v: B x t x D
         kv_cache: B x T x H x (K+V)
       """
       b_size, seq_len, _ = q.shape
@@ -244,6 +239,7 @@ class MultiHeadAttention(hk.Module):
       # v_heads: B x T x H x V
       v_heads = self.wv(v).reshape(b_size, seq_len, self.num_kv_heads, self.v_dim)
       
+      # stack newly computed heads with cached key and value heads to create the the full key and value heads
       if kv_cache is not None:
         b_size_cached, seq_len_cached, num_kv_heads_cached, kv_dim_cached = kv_cache.shape
         assert (b_size_cached, num_kv_heads_cached, kv_dim_cached) == (b_size, self.num_kv_heads, self.k_dim + self.v_dim)
@@ -294,43 +290,43 @@ class MoEBlock(hk.Module):
 
   def _compute_token_expert_assignment(self, x_flat: jax.Array, expert_assignment: jax.Array) -> jax.Array:
     """
-      x_flat: (B * t) x D
-
       B: batch size
       t: length of the input sequence
       D: embedding dimension
+
+      x_flat: (B * t) x D
     """
 
     B_t, _ = x_flat.shape
 
     # expert capacity is the fraction of the total number of tokens that can be routed to an expert
     expert_capacity = math.floor(B_t * self.expert_capacity)
-    # For each token, and for each choice, and for each expert, it either occupies that expert or not
+    # For each token, each choice, and  each expert, there is either an assignment of the token to the expert ornot
     expert_assignment_onehot = jax.nn.one_hot(expert_assignment, self.num_experts) # (B * t) x top_k x num_experts
-    # Cumulative sum over the token indices, and then cumulaitive sum over the top_k dimension. This ensure that
-    # the first expert choice of a token is prioritized over the second expert choice of any other token in position
-    # For each token, for each choice index, and then each expert, we have a position of the token in that expert
+
+    # Cumulative sum over the token indices, and then cumulaitive sum over the top_k dimension. This generates position of a token in an expert's capacity. The order of sum ensure that the first expert choice of a token is prioritized over the second expert choice of any other token, in the expert's position
     position_in_experts = jnp.cumsum(jnp.cumsum(expert_assignment_onehot, axis=0), axis=1).astype(jnp.int32) # (B * t) x top_k x num_experts
-    # update the expert occopancy mask by position in the expert and drop tokens that not within the expert capacity
+    
+    # Using the assigned positions, remove any token that did not make it within an expert's capacity.
     expert_mask = expert_assignment_onehot * jnp.less(position_in_experts, expert_capacity) # (B * t) x top_k x num_experts
+    # By summing over the experts dimenion, obtain as mask of which tokens are processed by some experts and which ones are orphants.
+    token_assignment_mask = jnp.sum(expert_mask, axis=-1) # (B * t) x top_k
 
 
-    # Occupancy mask for each token, choice index, expert, and the position in the expert. Multiply by the expert mask to remove tokens that were droppd
+    # Apply onehot operate to the position array creates an occupancy mask for each token, choice index, expert, and the position in the expert. Multiply by the expert mask to remove tokens that were droppd
     expert_choices = jax.nn.one_hot(position_in_experts, expert_capacity) * expert_mask[..., None] # (B * t) x top_k x num_experts x expert_capacity
-    # Sum over choice indices, because for each token, and, expert, the expert can only by chose as one of choices
-    # This generates an occupancy mask for each token, and for each capacity position, whether there's an allocation
+  
+    # Sum over the top_k dimenion, because for each token, and, expert, the expert can only be chosen as one of the top_k choices - the resulting mask will be binary. It is an occupancy mask for each token, and for each capacity position, whether there's an allocation
     expert_choices = jnp.sum(expert_choices, axis=1) # (B * t) x num_experts x expert_capacity
-    expert_choices = expert_choices.transpose(1, 2, 0) # num_experts x expert_capacity x (B * t)
+    expert_choices = expert_choices.transpose(1, 2, 0).astype(jnp.int32) # num_experts x expert_capacity x (B * t)
 
-    # For each token, and for each choice index, which expert does it get assigned to. Note that this map contains values of 0 which could mean that the token is not assigned to any expert. But that information is stored in token_assignment_mask
+    # For each token, and for each choice index, which expert it gets assigned to. Note that this map contains values of 0, which is ambiguous between assignment to expert 0 and the token being an orphant. But which tokens were dropped is store in token_assignment_mask
     expert_assignment = jnp.einsum('tke, e -> tk', expert_mask, jnp.arange(self.num_experts)) # (B * t) x top_k
     # Extract out the position in the selected expert
     position_in_selected_experts = jnp.einsum('tke, tke -> tk', expert_mask, position_in_experts) # (B * t) x top_k
-    # Stack them 
+    # Stack them to a single tensor
     expert_position_assignment = jnp.stack([expert_assignment, position_in_selected_experts], axis=-1).astype(jnp.int32) # (B * t) x top_k x 2
 
-    # A mask for which tokens were dropped.
-    token_assignment_mask = jnp.sum(expert_mask, axis=-1) # (B * t) x top_k
 
     return expert_choices, expert_position_assignment, token_assignment_mask
 
@@ -339,6 +335,7 @@ class MoEBlock(hk.Module):
         ff = DenseFF(self.emd_dim, self.hidden_dim, bias=self.ff_bias)
         return ff(x)
       
+      # Initialize a batch of parameters
       expert_init, expert_apply = hk.transform(expert_fn)
       init_experts = hk.experimental.transparent_lift(
         vmap(expert_init, in_axes=0, out_axes=0),
@@ -368,18 +365,17 @@ class MoEBlock(hk.Module):
       return expert_outputs
 
   def __call__(self, x: jax.Array) -> jax.Array:
-    """
-      x: B x t x D
-      
+    """      
       B: batch size
       t: length of the input sequence
       D: embedding dimension
+
+      x: B x t x D
     """
     b, t, D = x.shape
     x_flat = x.reshape((b * t, D)) 
 
-    # expert_assignment: (B * t) x top_k
-    # expert_scores: (B * t) x top_k
+    # expert_assignment, expert_scores: (B * t) x top_k
     expert_assignment, expert_scores = self._compute_expert_scores(x_flat)
 
     # expert_choices: num_experts x expert_capacity x (B * t)
@@ -387,16 +383,17 @@ class MoEBlock(hk.Module):
     # token_assignment_mask: (B * t) x top_k
     expert_choices, expert_position_assignment, token_assignment_mask = self._compute_token_expert_assignment(x_flat, expert_assignment)
 
-    # Reshape
+    # Reshape to have a batch dimension
     expert_scores = jnp.reshape(expert_scores, ((b, t, self.top_k))) # B x t x top_k
     expert_position_assignment = jnp.reshape(expert_position_assignment, ((b, t, self.top_k, 2))) # B x t x top_k x 2
     token_assignment_mask = jnp.reshape(token_assignment_mask, ((b, t, self.top_k))) # B x t x top_k
     # Assign x into expert and capacity positions
     grouped_x = jnp.einsum('ect, tD -> ecD', expert_choices, x_flat) # num_experts x expert_capacity x D
     
-
+    # Process x with each expert, potentially in parallel across the experts
     expert_outputs = self._compute_experts(grouped_x) # num_experts x expert_capacity x D
     expert_outputs = expert_outputs[expert_position_assignment[..., 0], expert_position_assignment[..., 1], :] # B x t x top_k x D
+  
     # Dropped tokens will receive a residual connection 
     expert_outputs = jnp.where(token_assignment_mask[..., None], expert_outputs, x[..., None, :]) # B x t x top_k x D
     result = jnp.einsum('btkD, btk -> btD', expert_outputs, expert_scores) # B x t x D
@@ -453,21 +450,24 @@ class TransformerBlock(hk.Module):
       self.ff = DenseFF(emd_dim, hidden_dim, bias=ff_bias)
 
   def __call__(self, x: jax.Array, kv_cache: jax.Array = None, is_training=True) -> jax.Array:
-    """
-      x: B x t x D
-      kv_cache: B x T x H x (K+V)
-      
+    """      
       B: batch size
       t: length of the input sequence
       D: embedding dimension
       K=Q: key/query dimension
       V: value dimension
       H: number of key/value heads
+
+      x: B x t x D
+      kv_cache: B x T x H x (K+V)
     """
 
+    # Normalize before attention
     h = self.pre_layer_norm(x)
     h, new_kv_cache =  self.attn(h, h, h, kv_cache, is_training)
+    # Residual connection
     h = h + x 
+    # Post residual normalization
     r = self.post_attn_norm(h)
     if self.num_experts > 1:
       r = self.moe(r)
@@ -541,6 +541,10 @@ class MoeTransformer(hk.Module):
       self.n_vocab = n_vocab
     
     def get_embedding(self, x):
+      """
+        Obtain transformed functions for embedding encoding and decoding that accept shared parameters
+        We do this because there is not native support for using the same encoder for decoding in haiku modules
+      """
       def encode(x):
         emd = Embedding(self.emd_dim, self.n_vocab)
         return emd.encode(x)
@@ -557,9 +561,6 @@ class MoeTransformer(hk.Module):
 
     def __call__(self, x: jax.Array, kv_caches: Dict[int, jax.Array] = {}, is_training=True) -> jax.Array:
       """
-        x: B x t x D
-        kv_caches[i]: B x T x H x (K+V)
-        
         B: batch size
         t: length of the input sequence
         T: length of the attended sequence
@@ -567,6 +568,9 @@ class MoeTransformer(hk.Module):
         K=Q: key/query dimension
         V: value dimension
         H: number of key/value heads
+
+        x: B x t x D
+        kv_caches[i]: B x T x H x (K+V)
       """
       encode, decode, embedding_params = self.get_embedding(x)
       h = encode(embedding_params, hk.next_rng_key(), x)
