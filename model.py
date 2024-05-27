@@ -1,36 +1,38 @@
-import jax.numpy as jnp
-from typing import Dict, List
-from jax import grad, jit, vmap, random
-import jax 
-import haiku as hk
+import os
+import math
+from functools import partial
+DEVICE_COUNT = 8
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count={}".format(
+    DEVICE_COUNT
+)
+
+import jax.numpy as jnp  # noqa: E402
+from typing import Dict, List # noqa: E402
+from jax import grad, jit, vmap, random # noqa: E402
+from jax.sharding import Mesh, PartitionSpec # noqa: E402
+from jax.experimental import mesh_utils # noqa: E402
+from jax.experimental.shard_map import shard_map # noqa: E402
+import jax # noqa: E402
+import haiku as hk # noqa: E402
+
 
 """
 TODO:
-- make things jittable and graddable
-
 - tokenizer 
-
-- training
-- multi GPU
+- training loop
+- generation
 """
+
 
 w_init = hk.initializers.TruncatedNormal(stddev=1)
 
-
-class Dropout(hk.Module):
-  def __init__(self, rate: float = 0.1, name: str=None) -> None:
-    super().__init__(name)
-    self.rate = rate
-
-  def __call__(self, x: jnp.array, is_training=True) -> jnp.array:
-    if is_training:
-      key = random.split(random.key(1), 1)
-      # apply the scaling during training so inference is faster
-      dropout_mask = random.bernoulli(key, 1 - self.rate, x.shape) / (1 - self.rate)
-      return x * dropout_mask
-    else:
-      return x
-
+@partial(jit, static_argnames=('is_training', 'rate'))
+def dropout(x: jax.Array, rate, rng, is_training=True):
+  if is_training and rate > 0:
+    dropout_mask = random.bernoulli(rng, 1 - rate, x.shape)
+    return x * dropout_mask / (1 - rate)
+  else:
+    return x
 
 class Linear(hk.Module):
   def __init__(self, 
@@ -43,14 +45,14 @@ class Linear(hk.Module):
     self.out_dim = out_dim
     self.bias = bias
 
-  def __call__(self, x: jnp.array) -> jnp.array:
+  def __call__(self, x: jax.Array) -> jax.Array:
       w = hk.get_parameter('w', (self.in_dim, self.out_dim), init=w_init)
-      b =  hk.get_parameter('b', (self.out_dim,), init=w_init)
       ret = jnp.einsum('io, ...i -> ...o',  w, x)
       if self.bias:
+        b = hk.get_parameter('b', (self.out_dim,), init=w_init)
         ret += b
-      return ret
 
+      return ret
 
 class RMSNorm(hk.Module):
   def __init__(self, 
@@ -59,7 +61,7 @@ class RMSNorm(hk.Module):
     super().__init__(name)
     self.eps = eps
 
-  def __call__(self, x: jnp.array) -> jnp.array:
+  def __call__(self, x: jax.Array) -> jax.Array:
     input_dtype = x.dtype
     x = x.astype(jnp.float32)
 
@@ -70,8 +72,6 @@ class RMSNorm(hk.Module):
   
     return x.astype(input_dtype)
 
-
-
 class DenseFF(hk.Module):
   def __init__(self,
               emd_dim: int, 
@@ -79,70 +79,69 @@ class DenseFF(hk.Module):
               activation: str = 'gelu', 
               bias: bool = True,
               name: str = None) -> None:
+
     super().__init__(name)
     self.w1 = Linear(emd_dim, hidden_dim, bias=bias)
     self.w2 = Linear(emd_dim, hidden_dim, bias=bias)
     self.w3 = Linear(hidden_dim, emd_dim, bias=bias)
 
+    if activation not in ('gelu', 'silu', 'relu'):
+      raise ValueError(f'Unknown activation function: {activation}')
+      
     if activation == 'gelu':
       self.activation = jax.nn.gelu
     elif activation == 'silu':
       self.activation = jax.nn.silu
-    else:
-      raise ValueError(f'Unknown activation function: {activation}')
+    elif activation == 'relu':
+      self.activation = jax.nn.relu
 
-  def __call__(self, x: jnp.array) -> jnp.array:
-    return self.w3(self.activation(self.w2(x)) * self.w1(x))
-
+  def __call__(self, x: jax.Array) -> jax.Array:
+    h = self.w2(x) * self.w1(x)
+    h = self.activation(h)
+    return self.w3(h)
 
 
 class RotaryEmbedding(hk.Module):
   def __init__(self, 
-              dim, 
+              dim,
+              max_seq_len: int = 8000,
               base: int = 10000,
               name: str = None) -> None:
     super().__init__(name)
     assert dim % 2 == 0
 
+    # thetas: D/2
     exps = -jnp.arange(0, dim, 2, dtype=jnp.float32) / dim
-    self.thetas = base ** exps
-    self.cached_seq_len = 0
-    self.cos_cache = jnp.zeros((0,0,0,0))
-    self.sin_cache = jnp.zeros((0,0,0,0))
+    thetas = base ** exps
 
-  def _neg_half(self, x: jnp.array) -> jnp.array:
+    t = jnp.arange(0, max_seq_len, dtype=jnp.float32)
+    # ticks: t x D/2
+    ticks = jnp.outer(t, thetas)
+    # ticks: t x D/2 -> 1 x t x 1 x D 
+    ticks = jnp.tile(ticks, reps=(1,2))[None, :, None, :] 
+
+    # cos, sin: 1 x t x 1 x D
+    hk.set_state('cos', jnp.cos(ticks))
+    hk.set_state('sin', jnp.sin(ticks))
+
+  def _neg_half(self, x: jax.Array) -> jax.Array:
     x1, x2 = jnp.split(x, 2, axis=-1)
-    return jnp.stack([-x2, x1], axis=-1)
+    return jnp.concatenate([-x2, x1], axis=-1)
 
-  def __call__(self, x: jnp.array, offset: int = 0) -> jnp.array:
+  def __call__(self, x: jax.Array, offset: int = 0) -> jax.Array:
     """
       x: B x t x H x D
     """
-    _, seq_len, _, _ = x.shapes 
-    if self.cached_seq_len >= offset + seq_len:
-      # cos, sin: 1 x t x 1 x D
-      cos = self.cos_cache[offset:offset + seq_len]
-      sin = self.sin_cache[offset:offset + seq_len]
-      rote = x * cos + self._neg_half(x) *sin
-    if self.cached_seq_pos < offset + seq_len:
-      t = jnp.arange(self.cached_seq_pos, offset + seq_len, dtype=jnp.float32)
-      # ticks: t x D/2
-      ticks = jnp.outer(t, self.thetas)
-      # ticks: t x D/2 -> 1 x t x 1 x D 
-      ticks = jnp.tile(ticks, reps=(1,2))[None, :, None :] 
+    _, seq_len, _, D = x.shape
 
-      # cos_cache, sin_cache: 1 x t' x 1 x D
-      self.cos_cache = jnp.stack(self.cos_cache, jnp.cos(ticks), axis=1)
-      self.sin_cache = jnp.stack(self.sin_cache, jnp.sin(ticks), axis=1)
-      self.cached_seq_len = offset + seq_len
-
-    cos = self.cos_cache[offset:offset + seq_len]
-    sin = self.sin_cache[offset:offset + seq_len]
-    rote = x * cos + self._neg_half(x) *sin
+    cos = jax.lax.dynamic_slice(hk.get_state('cos'), (0, offset, 0, 0), (1, seq_len, 1, D))
+    sin = jax.lax.dynamic_slice(hk.get_state('sin'), (0, offset, 0, 0), (1, seq_len, 1, D))
+    rote = x * cos + self._neg_half(x) * sin
+    
     return rote
 
 
-class MultiHeadSelfAttention(hk.Module):
+class MultiHeadAttention(hk.Module):
     def __init__(self, 
         num_q_heads, 
         num_kv_heads,
@@ -150,13 +149,13 @@ class MultiHeadSelfAttention(hk.Module):
         v_dim: int,
         k_dim: int,
         bias: bool = False,
-        att_dropout: float = 0.1,
+        attn_dropout: float = 0.0,
         resid_dropout: float = 0.0,
         name: str = None,
     ) -> None:
         super().__init__(name)
         assert num_q_heads % num_kv_heads == 0
-        assert att_dropout >= 0 and resid_dropout >=0
+        assert attn_dropout >= 0 and resid_dropout >=0
 
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -173,11 +172,12 @@ class MultiHeadSelfAttention(hk.Module):
           bias=self.bias
         )
 
-        self.attn_dropout = Dropout(rate=att_dropout)
-        self.resid_dropout = Dropout(rate=resid_dropout)
-        self.rote = RotaryEmbedding(self.emd_dim)
+        self.attn_dropout = attn_dropout
+        self.resid_dropout = resid_dropout
+        self.rote = RotaryEmbedding(self.k_dim)
 
-    def __call__(self, x: jnp.array, kv_cache: jnp.array = None, is_training=True) -> jnp.array:
+    # PERFORMANCE: taking three separate inputs is faster with jit
+    def __call__(self, q: jax.Array, k: jax.Array, v: jax.Array, kv_cache: jax.Array = None, is_training=True) -> jax.Array:
       """
         B: batch size
         t: length of the input sequence
@@ -190,24 +190,21 @@ class MultiHeadSelfAttention(hk.Module):
         G: number of query groups
       """
 
-      # x: B x t x D
+      # q, k, v: B x t x D
       # kv_cache: B x T x H x (K+V)
       # q_heads: B x t x h x Q=K
       # k_heads: B x T x H x K
       # v_heads: B x T x H x V
-      q_heads, k_heads, v_heads = self._attention_heads(x, kv_cache)
-      # attn_output: B x t x D
-      attn_output = self._grouped_attention(q_heads, k_heads, v_heads, is_training)
-
+      q_heads, k_heads, v_heads = self._attention_heads(q, k, v, kv_cache)
+      attn_output = self._grouped_attention(q_heads, k_heads, v_heads, is_training) # B x t x D
       new_kv_cache = jnp.concatenate([k_heads, v_heads], axis=-1)
       
       return attn_output, new_kv_cache
 
-
-    def _grouped_attention(self, q_heads: jnp.array, k_heads: jnp.array, v_heads: jnp.array, is_training) -> jnp.array:
+    def _grouped_attention(self, q_heads: jax.Array, k_heads: jax.Array, v_heads: jax.Array, is_training) -> jax.Array:
       b_size, q_seq_len, _, _,  = q_heads.shape
       _, k_seq_len, _, _ = k_heads.shape
-      
+
       # grouped_q_heads: B x t x h x K -> B x t x G x H x K
       grouped_q_heads = q_heads.reshape((b_size, q_seq_len, self.q_group_size, self.num_kv_heads, self.k_dim))
 
@@ -217,8 +214,8 @@ class MultiHeadSelfAttention(hk.Module):
       attn_mask = jnp.tril(jnp.ones((k_seq_len, k_seq_len)))[-q_seq_len:, :]
       attn_scores = jnp.where(attn_mask, attn_scores, -jnp.inf)
       # Softmax, followed by dropout
-      attn_scores = jax.nn.softmax(attn_scores / jnp.sqrt(self.k_dim), dim=-1).astype(v_heads.dtype)
-      attn_scores = self.attn_dropout(attn_scores, is_training)
+      attn_scores = jax.nn.softmax(attn_scores / jnp.sqrt(self.k_dim), axis=-1).astype(v_heads.dtype)
+      attn_scores = dropout(attn_scores, self.attn_dropout, hk.next_rng_key(), is_training)
       # Apply attention scores on the value heads. Aggregation over T = length of the attended sequence
       attn_output = jnp.einsum("BGHtT, BTHV -> BtGHV", attn_scores, v_heads)
 
@@ -226,31 +223,28 @@ class MultiHeadSelfAttention(hk.Module):
       attn_output = attn_output.reshape(b_size, q_seq_len, self.q_group_size * self.num_kv_heads * self.v_dim)
       # Apply linear map on the attn_output: B x t x (G * H * V) -> B x t x D, followed by dropout
       attn_output = self.wo(attn_output)
-      attn_output = self.resid_dropout(attn_output, is_training)
+      attn_output = dropout(attn_output, self.resid_dropout, hk.next_rng_key(), is_training)
 
       return attn_output
 
-    def _attention_heads(self, x: jnp.array, kv_cache: jnp.array = None) -> List[jnp.array]:
+    def _attention_heads(self, q: jax.Array, k: jax.Array, v: jax.Array, kv_cache: jax.Array = None) -> List[jax.Array]:
       """
         x: B x t x D
         kv_cache: B x T x H x (K+V)
       """
-      b_size, seq_len, _ = x.shape
+      b_size, seq_len, _ = q.shape
       offset = 0 if kv_cache is None else kv_cache.shape[1]
 
       # q_heads: B x t x h x Q=K
-      q_heads = self.wq(x) \
-                .reshape(b_size, seq_len, self.num_q_heads, self.k_dim)
+      q_heads = self.wq(q).reshape(b_size, seq_len, self.num_q_heads, self.k_dim)
       q_heads = self.rote(q_heads, offset) 
       # k_heads: B x T x H x K
-      k_heads = self.wk(x) \
-                .reshape(b_size, seq_len, self.num_kv_heads, self.k_dim)
+      k_heads = self.wk(k).reshape(b_size, seq_len, self.num_kv_heads, self.k_dim)
       k_heads = self.rote(k_heads, offset)
       # v_heads: B x T x H x V
-      v_heads = self.wv(x) \
-                .reshape(b_size, seq_len, self.num_kv_heads, self.v_dim)
+      v_heads = self.wv(v).reshape(b_size, seq_len, self.num_kv_heads, self.v_dim)
       
-      if kv_cache:
+      if kv_cache is not None:
         b_size_cached, seq_len_cached, num_kv_heads_cached, kv_dim_cached = kv_cache.shape
         assert (b_size_cached, num_kv_heads_cached, kv_dim_cached) == (b_size, self.num_kv_heads, self.k_dim + self.v_dim)
         
@@ -261,95 +255,204 @@ class MultiHeadSelfAttention(hk.Module):
         v_heads = jnp.concatenate([v_heads_cached, v_heads], axis=1)
 
       return q_heads, k_heads, v_heads
-    
 
 
 class MoEBlock(hk.Module):
   def __init__(self,
       emd_dim: int,
-      experts: List[DenseFF],
+      hidden_dim: int,
+      num_experts: int = 8,
       active_experts: int = 2,
+      expert_capacity: float = 1.0,
+      ff_bias: bool = False,
+      multi_device=True,
       name: str = None
   ):
     super().__init__(name)
+    if multi_device:
+      assert num_experts <= DEVICE_COUNT or num_experts % DEVICE_COUNT == 0
+    assert active_experts <= num_experts
+    self.expert_capacity = expert_capacity
     self.top_k = active_experts
-    self.experts = experts
-    self.router = Linear(emd_dim, len(experts))
 
-  def _compute_expert_scores(self, x: jnp.array) -> jnp.array:
+    
+    self.emd_dim = emd_dim
+    self.hidden_dim = hidden_dim
+    self.ff_bias = ff_bias
+    self.num_experts = num_experts
+    self.router = Linear(emd_dim, num_experts)
+
+    self.multi_device = multi_device
+  
+  def _compute_expert_scores(self, x_flat: jax.Array) -> jax.Array:
+    expert_scores = self.router(x_flat.astype(jnp.float32)) # (B * t) x num_experts
+    expert_scores, expert_assignment = jax.lax.top_k(expert_scores, k=self.top_k) # (B * t) x top_k
+    expert_scores = jax.nn.softmax(expert_scores, axis=-1).astype(x_flat.dtype) # (B * t) x top_k
+
+    return expert_assignment, expert_scores
+
+
+  def _compute_token_expert_assignment(self, x_flat: jax.Array, expert_assignment: jax.Array) -> jax.Array:
+    """
+      x_flat: (B * t) x D
+
+      B: batch size
+      t: length of the input sequence
+      D: embedding dimension
+    """
+
+    B_t, _ = x_flat.shape
+
+    # expert capacity is the fraction of the total number of tokens that can be routed to an expert
+    expert_capacity = math.floor(B_t * self.expert_capacity)
+    # For each token, and for each choice, and for each expert, it either occupies that expert or not
+    expert_assignment_onehot = jax.nn.one_hot(expert_assignment, self.num_experts) # (B * t) x top_k x num_experts
+    # Cumulative sum over the token indices, and then cumulaitive sum over the top_k dimension. This ensure that
+    # the first expert choice of a token is prioritized over the second expert choice of any other token in position
+    # For each token, for each choice index, and then each expert, we have a position of the token in that expert
+    position_in_experts = jnp.cumsum(jnp.cumsum(expert_assignment_onehot, axis=0), axis=1).astype(jnp.int32) # (B * t) x top_k x num_experts
+    # update the expert occopancy mask by position in the expert and drop tokens that not within the expert capacity
+    expert_mask = expert_assignment_onehot * jnp.less(position_in_experts, expert_capacity) # (B * t) x top_k x num_experts
+
+
+    # Occupancy mask for each token, choice index, expert, and the position in the expert. Multiply by the expert mask to remove tokens that were droppd
+    expert_choices = jax.nn.one_hot(position_in_experts, expert_capacity) * expert_mask[..., None] # (B * t) x top_k x num_experts x expert_capacity
+    # Sum over choice indices, because for each token, and, expert, the expert can only by chose as one of choices
+    # This generates an occupancy mask for each token, and for each capacity position, whether there's an allocation
+    expert_choices = jnp.sum(expert_choices, axis=1) # (B * t) x num_experts x expert_capacity
+    expert_choices = expert_choices.transpose(1, 2, 0) # num_experts x expert_capacity x (B * t)
+
+    # For each token, and for each choice index, which expert does it get assigned to. Note that this map contains values of 0 which could mean that the token is not assigned to any expert. But that information is stored in token_assignment_mask
+    expert_assignment = jnp.einsum('tke, e -> tk', expert_mask, jnp.arange(self.num_experts)) # (B * t) x top_k
+    # Extract out the position in the selected expert
+    position_in_selected_experts = jnp.einsum('tke, tke -> tk', expert_mask, position_in_experts) # (B * t) x top_k
+    # Stack them 
+    expert_position_assignment = jnp.stack([expert_assignment, position_in_selected_experts], axis=-1).astype(jnp.int32) # (B * t) x top_k x 2
+
+    # A mask for which tokens were dropped.
+    token_assignment_mask = jnp.sum(expert_mask, axis=-1) # (B * t) x top_k
+
+    return expert_choices, expert_position_assignment, token_assignment_mask
+
+  def _compute_experts(self, grouped_x: jax.Array) -> jax.Array:
+      def expert_fn(x):
+        ff = DenseFF(self.emd_dim, self.hidden_dim, bias=self.ff_bias)
+        return ff(x)
+      
+      expert_init, expert_apply = hk.transform(expert_fn)
+      init_experts = hk.experimental.transparent_lift(
+        vmap(expert_init, in_axes=0, out_axes=0),
+        allow_reuse=True
+      )
+      expert_params = init_experts(
+        hk.next_rng_keys(self.num_experts),
+        jnp.zeros((self.num_experts, 1, self.emd_dim))
+      )
+      
+      if self.multi_device:
+        devices = mesh_utils.create_device_mesh(DEVICE_COUNT)[:self.num_experts]
+        @partial(
+          shard_map,
+          mesh=Mesh(devices, axis_names=('e')),
+          in_specs=(PartitionSpec('e',), PartitionSpec('e',)),
+          out_specs=PartitionSpec('e',),
+          check_rep=False
+        )
+        def parallel_expert_fn(params, grouped_x):
+          return vmap(expert_apply, in_axes=(0, None, 0), out_axes=0)(params, None, grouped_x)
+  
+        expert_outputs = parallel_expert_fn(expert_params, grouped_x) # num_experts x expert_capacity x D
+      else:
+        expert_outputs = vmap(expert_apply, in_axes=(0, None, 0), out_axes=0)(expert_params, None, grouped_x) # num_experts x expert_capacity x D
+
+      return expert_outputs
+
+  def __call__(self, x: jax.Array) -> jax.Array:
     """
       x: B x t x D
-      expert_scores: B x t x num_experts
-      selected_experts: B x t x top_k
       
       B: batch size
       t: length of the input sequence
       D: embedding dimension
     """
-    # expert_scores: B x t x num_experts
-    expert_scores = self.router(x.astype(jnp.float32))
-    expert_scores, selected_experts = jax.lax.top_k(expert_scores, k=self.top_k)
-    expert_scores = jax.nn.softmax(expert_scores, axis=-1).astype(x.dtype)
+    b, t, D = x.shape
+    x_flat = x.reshape((b * t, D)) 
 
-    return expert_scores, selected_experts
+    # expert_assignment: (B * t) x top_k
+    # expert_scores: (B * t) x top_k
+    expert_assignment, expert_scores = self._compute_expert_scores(x_flat)
 
-  def __call__(self, x: jnp.array) -> jnp.array:
-    """
-      x: B x t x D
-      
-      B: batch size
-      t: length of the input sequence
-      D: embedding dimension
-    """
-    # expoert_scores: B x t x top_k
-    expert_scores, selected_experts = self._compute_expert_scores(x)
+    # expert_choices: num_experts x expert_capacity x (B * t)
+    # expert_position_assignment: (B * t) x top_k x 2
+    # token_assignment_mask: (B * t) x top_k
+    expert_choices, expert_position_assignment, token_assignment_mask = self._compute_token_expert_assignment(x_flat, expert_assignment)
 
-    r = jnp.zeros_like(x)
-    for i, expert in enumerate(self.experts):
-      # select batch and token indices routed to this expert
-      b, t, e = jnp.where(selected_experts == i)
-      # apply expert to the selected tokens and update batch and token indices
-      r = r.at[b, t].add(expert(x[b, t])) * expert_scores[b, t, e]
+    # Reshape
+    expert_scores = jnp.reshape(expert_scores, ((b, t, self.top_k))) # B x t x top_k
+    expert_position_assignment = jnp.reshape(expert_position_assignment, ((b, t, self.top_k, 2))) # B x t x top_k x 2
+    token_assignment_mask = jnp.reshape(token_assignment_mask, ((b, t, self.top_k))) # B x t x top_k
+    # Assign x into expert and capacity positions
+    grouped_x = jnp.einsum('ect, tD -> ecD', expert_choices, x_flat) # num_experts x expert_capacity x D
+    
 
-    return r
+    expert_outputs = self._compute_experts(grouped_x) # num_experts x expert_capacity x D
+    expert_outputs = expert_outputs[expert_position_assignment[..., 0], expert_position_assignment[..., 1], :] # B x t x top_k x D
+    # Dropped tokens will receive a residual connection 
+    expert_outputs = jnp.where(token_assignment_mask[..., None], expert_outputs, x[..., None, :]) # B x t x top_k x D
+    result = jnp.einsum('btkD, btk -> btD', expert_outputs, expert_scores) # B x t x D
+
+    return result
 
 
 class TransformerBlock(hk.Module):
   def __init__(self, 
     emd_dim: int,
-    hidden_dim: int,
-    num_experts: int,
-    active_experts: int,
     num_q_heads, 
     num_kv_heads,
     v_dim: int,
     k_dim: int,
+    hidden_dim: int,
+    num_experts: int,
+    active_experts: int,
+    expert_capacity: int,
     ff_bias: bool = False,
+    multi_device: bool = True,
     attn_bias: bool = False,
-    att_dropout: float = 0.1,
+    attn_dropout: float = 0.1,
     attn_resid_dropout: float = 0.0,
     name: str = None,
   ) -> None:
     super().__init__(name)
     self.pre_layer_norm = RMSNorm()
     self.post_attn_norm = RMSNorm()
-    self.attn = MultiHeadSelfAttention(
+    self.emd_dim = emd_dim
+
+    self.attn = MultiHeadAttention(
       num_q_heads, 
       num_kv_heads,
       emd_dim,
       v_dim,
       k_dim,
       bias=attn_bias,
-      att_dropout=att_dropout,
+      attn_dropout=attn_dropout,
       resid_dropout=attn_resid_dropout
     )
+
     self.num_experts = num_experts
     if num_experts > 1:
-      experts = [DenseFF(emd_dim, hidden_dim, bias=ff_bias) for _ in range(num_experts)]
-      self.moe_block = MoEBlock(emd_dim, experts, active_experts)
-    else:
+      self.moe = MoEBlock(
+        emd_dim, 
+        hidden_dim,
+        num_experts,
+        active_experts,
+        expert_capacity,
+        ff_bias,
+        multi_device
+      )
+    else: 
       self.ff = DenseFF(emd_dim, hidden_dim, bias=ff_bias)
-  def __call__(self, x: jnp.array, kv_cache: jnp.array = None, is_training=True) -> jnp.array:
+
+  def __call__(self, x: jax.Array, kv_cache: jax.Array = None, is_training=True) -> jax.Array:
     """
       x: B x t x D
       kv_cache: B x T x H x (K+V)
@@ -363,15 +466,13 @@ class TransformerBlock(hk.Module):
     """
 
     h = self.pre_layer_norm(x)
-    h, new_kv_cache = self.attn(h, kv_cache, is_training)
+    h, new_kv_cache =  self.attn(h, h, h, kv_cache, is_training)
     h = h + x 
     r = self.post_attn_norm(h)
-
     if self.num_experts > 1:
-      r = self.moe_block(r)
+      r = self.moe(r)
     else:
       r = self.ff(r)
-    r = r + h
 
     return r, new_kv_cache
   
@@ -379,61 +480,82 @@ class TransformerBlock(hk.Module):
 class Embedding(hk.Module):
   def __init__(self, 
               emd_dim: int, 
-              vocab_size: int,
+              n_vocab: int,
               name: str = None) -> None:
     super().__init__(name)
     self.emd_dim = emd_dim
-    self.vocab_size = vocab_size
+    self.vocab_size = n_vocab
 
-  def encode(self, x: jnp.array) -> jnp.array:
+  def encode(self, x: jax.Array) -> jax.Array:
     embedding = hk.get_parameter('embedding', (self.vocab_size, self.emd_dim), init=w_init)
     return jnp.einsum('ve, ...v -> ...e', embedding, x)
 
-  def decode(self, x: jnp.array) -> jnp.array:
+  def decode(self, x: jax.Array) -> jax.Array:
     embedding = hk.get_parameter('embedding', (self.vocab_size, self.emd_dim), init=w_init)
     return jnp.einsum('ve, ...e -> ...v', embedding, x)
 
 
-class MoETransformer(hk.Module):
+class MoeTransformer(hk.Module):
     def __init__(self,
       depth: int, 
-      vocab_size: int,
+      n_vocab: int,
       emd_dim: int,
-      hidden_dim: int,
-      num_experts: int,
       num_q_heads, 
       num_kv_heads,
       v_dim: int,
       k_dim: int,
+      hidden_dim: int,
+      num_experts: int,
+      active_experts: int,
+      expert_capacity: int,
       ff_bias: bool = False,
+      multi_device: bool = True,
       attn_bias: bool = False,
-      att_dropout: float = 0.1,
+      attn_dropout: float = 0.0,
       attn_resid_dropout: float = 0.0,
       name: str = None,
     ): 
       super().__init__(name)
 
-      self.blocks = [
-        TransformerBlock(
-          emd_dim,
-          hidden_dim,
-          num_experts,
-          num_q_heads, 
-          num_kv_heads,
-          v_dim,
-          k_dim,
-          ff_bias,
-          attn_bias,
-          att_dropout,
-          attn_resid_dropout
-        )
-        for _ in range(depth)
-      ]
-      self.embedding = Embedding(emd_dim, vocab_size)
-      self.normalize = RMSNorm()
-      
+      self.block_config = {
+        'emd_dim': emd_dim,
+        'num_q_heads': num_q_heads,
+        'num_kv_heads': num_kv_heads,
+        'v_dim': v_dim,
+        'k_dim': k_dim,
+        'hidden_dim': hidden_dim,
+        'num_experts': num_experts,
+        'active_experts': active_experts,
+        'expert_capacity': expert_capacity,
+        'ff_bias': ff_bias,
+        'attn_bias': attn_bias,
+        'attn_dropout': attn_dropout,
+        'attn_resid_dropout': attn_resid_dropout,
+      }
+      self.embedding = Embedding(emd_dim, n_vocab)
+      self.final_norm = RMSNorm(name='final_norm')
 
-    def __call__(self, x: jnp.array, kv_caches: Dict[int, jnp.array] = {}, is_training=True) -> jnp.array:
+      self.num_experts = num_experts
+      self.depth = depth
+      self.emd_dim = emd_dim
+      self.n_vocab = n_vocab
+    
+    def get_embedding(self, x):
+      def encode(x):
+        emd = Embedding(self.emd_dim, self.n_vocab)
+        return emd.encode(x)
+      
+      def decode(x):
+          emd = Embedding(self.emd_dim, self.n_vocab)
+          return emd.decode(x)
+      
+      encoder_init, encoder = hk.transform(encode)
+      _, decoder = hk.transform(decode)
+      embedding_params = hk.experimental.transparent_lift(encoder_init, allow_reuse=True)(hk.next_rng_key(), x)
+
+      return encoder, decoder, embedding_params
+
+    def __call__(self, x: jax.Array, kv_caches: Dict[int, jax.Array] = {}, is_training=True) -> jax.Array:
       """
         x: B x t x D
         kv_caches[i]: B x T x H x (K+V)
@@ -446,15 +568,17 @@ class MoETransformer(hk.Module):
         V: value dimension
         H: number of key/value heads
       """
-      new_kv_caches = {}
+      encode, decode, embedding_params = self.get_embedding(x)
+      h = encode(embedding_params, hk.next_rng_key(), x)
 
-      h = self.embedding.encode(x)
-      
-      for i, block in enumerate(self.blocks):
-        h, new_kv_cache = block(h, kv_caches[i], is_training)
+      new_kv_caches = {}
+      for i in range(self.depth):
+        # PERFORMANCE: module construction needs to happen here and not constructor for performance with jit        
+        block = TransformerBlock(**self.block_config, name='block_{}'.format(i))
+        h, new_kv_cache = block(h, kv_caches.get(i, None), is_training)
         new_kv_caches[i] = new_kv_cache
 
-      h = self.normalize(h)
-      r = self.embedding.decode(h)
+      h = self.final_norm(h)
+      r = decode(embedding_params, None, h)
 
       return r, new_kv_caches
