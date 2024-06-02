@@ -542,8 +542,8 @@ class MoeTransformer(hk.Module):
     
     def get_embedding(self, x):
       """
-        Obtain transformed functions for embedding encoding and decoding that accept shared parameters
-        We do this because there is not native support for using the same encoder for decoding in haiku modules
+        Obtain transformed functions for embedding encoder and decoder that accept shared parameters
+        We do this because there is no native support for tieing the encoder and decoder in Haiku.
       """
       def encode(x):
         emd = Embedding(self.emd_dim, self.n_vocab)
