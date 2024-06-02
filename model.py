@@ -18,7 +18,6 @@ import haiku as hk # noqa: E402
 
 """
 TODO:
-- tokenizer 
 - training loop
 - generation
 """
