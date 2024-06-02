@@ -7,11 +7,15 @@ import os
 import regex as re
 from datasets import load_dataset
 
-from utils import GPT4_SPLIT_PATTERN, get_counts, merge_counts, merge_tokens, render_token
+from utils import GPT4_SPLIT_PATTERN, get_pair_counts, merge_counts, merge_tokens, render_token
 from tokenizer import Tokenizer
 
 
 def split_dataset(dataset, num_splits):
+  """
+  Split the dataset into multiple splits, with the last one containing more entries
+  """
+
   size = len(dataset)
   split_size = size // num_splits
   splits = []
@@ -25,6 +29,11 @@ def split_dataset(dataset, num_splits):
   return splits
 
 def bpe(data_split, counts_queue, merge_pipe, num_merges):
+  """
+  Byte pair encoding algorithm on one node. For each iteration, get which ids to merge from master process,
+  merge, and send back the count of pairs
+  """
+
   gpt4_compiled_pattern = re.compile(GPT4_SPLIT_PATTERN)
 
   text_chunks = []
@@ -37,12 +46,18 @@ def bpe(data_split, counts_queue, merge_pipe, num_merges):
   for _ in range(num_merges):
     counts = {}
     for chunk_ids in ids:
-      counts = get_counts(chunk_ids, counts)
+      counts = get_pair_counts(chunk_ids, counts)
     counts_queue.put(counts)
     pair, idx = merge_pipe.recv()
     ids = [merge_tokens(chunk_ids, pair, idx) for chunk_ids in ids]
 
 def parallel_bpe(n_vocab, dataset, num_workers, log=False):
+  """
+  Parallel implementation of byte pair encoding algorithm.
+  Each worker will process a subset of the dataset and send back the counts of pairs to the master process.
+  The master process tally up the counts and pick which pair to to merge, and send the decision back to the worker.
+  """
+
   num_merges = n_vocab - 256
   counts_queue = Queue()
   merge_pipes = [Pipe() for _ in range(num_workers)]
