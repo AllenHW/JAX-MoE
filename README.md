@@ -16,9 +16,9 @@ The techniques used are fairly standard among state of the art models. So far it
 - High specificity of hyperparameters. Most implementations I've found generally assumed certain parameters to be coupled - for example, the key dimenion to be the model dimension divided by the number of heads. While such choice is proabably reasonable, for the sake of completeness I've made minmal assumptions on the relationships between these parameters so that the full space of hyperparameters can be explored.
 - Optimized for JIT compilation.
   - More to explore here but it's matching the official implementations in Haiku.
+- Parallel Byte Pair Encoding (BPE) algorithm
 
 ### TODO
-- [ ] Implement tokenizer
 - [ ] Implement training loop
 - [ ] Find a dataset to use for training
 - [ ] Generation code
