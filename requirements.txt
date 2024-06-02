@@ -2,4 +2,6 @@
 jax[cpu]==0.4.26
 dm-haiku==0.0.12
 jupyter==1.0.0
-
+regex==2024.5.15
+modal==0.62.197
+datasets==2.19.1
