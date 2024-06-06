@@ -2,18 +2,18 @@
 This is a reference implementation of an Mixture-of-Experts Transformer (MoE) model in Jax and Haiku. The original motivation was to personally learn Jax and to understand the details within MoE. I've documented the implementation so that it could be helpful for others who are going through a similar process.
 
 ### Key Features
-The techniques used are fairly standard among state of the art models. So far it supports:
+The techniques used are fairly standard among state-of-the-art models. So far it supports:
+- Parallel implementation of the Byte Pair Encoding (BPE) algorithm. 
 - Grouped Query Attention (GQA)
   - [paper](https://arxiv.org/pdf/2305.13245)
-  - A generalization of Multi-Query Attention, which supports having mutiple query heads look up against a single key head and bring in embeddings from a single value head.
+  - A generalization of Multi-Query Attention, where multiple query heads share a single key and value head. In GQA there are multiple key and value heads, each shared by a _group_ of query heads. Attention is computed between each key/value head and all query heads within the group. The results for all query heads across all groups are then concatenated and projected down to a lower dimension by the projection matrix (the same way as in multi-head attention.)
 - Rotary Embedding
   - [paper](https://arxiv.org/pdf/2104.09864)
 - Use KV cache to keep the computed key and value heads for previous tokens.
 - Mixture-of-Experts (MoE) block with capacity
-  - The current implementation uses a token choice model where each token are chhooses top K experts to which it was assigned by the router.
-  - Tokens that fall outside the capacity of an expert will be passed through as residual connection (i.e. effectively handled by a "no-op" expert)
-  - Computatin for each expert can be done on separate devices.
-- Parallel implementation of the Byte Pair Encoding (BPE) algorithm
+  - We use a token-choice model where each token chooses top K experts computed by the router.
+  - Tokens that fall outside the capacity of an expert will be passed through as a residual connection.
+  - Computatin for each expert is parallelized, potentially on separate devices.
 
 ### TODO
 - [ ] Implement training loop
