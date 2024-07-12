@@ -6,7 +6,7 @@ The techniques used are fairly standard among state-of-the-art models. So far it
 - Parallel implementation of the Byte Pair Encoding (BPE) algorithm. 
 - Grouped Query Attention (GQA)
   - [paper](https://arxiv.org/pdf/2305.13245)
-  - A generalization of Multi-Query Attention, where multiple query heads share a single key and value head. In GQA there are multiple key and value heads, each shared by a _group_ of query heads. Attention is computed between each key/value head and all query heads within the group. The results for all query heads across all groups are then concatenated and projected down to a lower dimension by the projection matrix (the same way as in multi-head attention.)
+  - A generalization of Multi-Query Attention, where multiple query heads share a single key and value head. In GQA there are multiple key and value heads, each shared by a _group_ of query heads. Attention is computed between each key/value head and the query heads within the group. The results for all query heads across all groups are then concatenated and projected down to a lower dimension by the projection matrix (the same way as in multi-head attention.)
 - Rotary Embedding
   - [paper](https://arxiv.org/pdf/2104.09864)
 - Use KV cache to keep the computed key and value heads for previous tokens.
